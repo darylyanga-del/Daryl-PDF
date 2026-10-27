@@ -6,11 +6,310 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+      - name: Write project files
+        run: |
+          mkdir -p app/src/main/java/com/example/pdffiller
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "PdfFiller"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.pdffiller"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.pdffiller"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+          }
+
+          dependencies {
+              implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+              implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.2")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="true"
+                  android:label="PDF Filler"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/example/pdffiller/PdfFormEngine.kt <<'EOF'
+          package com.example.pdffiller
+
+          import android.content.Context
+          import android.net.Uri
+          import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+          import com.tom_roush.pdfbox.pdmodel.PDDocument
+          import com.tom_roush.pdfbox.pdmodel.interactive.form.PDCheckBox
+          import com.tom_roush.pdfbox.pdmodel.interactive.form.PDChoice
+          import com.tom_roush.pdfbox.pdmodel.interactive.form.PDRadioButton
+          import com.tom_roush.pdfbox.pdmodel.interactive.form.PDTerminalField
+
+          enum class FieldType { TEXT, CHECKBOX, CHOICE, RADIO, OTHER }
+
+          data class FormField(
+              val name: String,
+              val type: FieldType,
+              val value: String,
+              val options: List<String> = emptyList()
+          )
+
+          object PdfFormEngine {
+
+              /** Call once, e.g. in Activity.onCreate. */
+              fun init(context: Context) = PDFBoxResourceLoader.init(context.applicationContext)
+
+              private fun open(context: Context, uri: Uri): PDDocument =
+                  context.contentResolver.openInputStream(uri)?.use { PDDocument.load(it) }
+                      ?: error("Cannot open $uri")
+
+              /** Lists every fillable field in the PDF. Empty list = no AcroForm. */
+              fun listFields(context: Context, source: Uri): List<FormField> =
+                  open(context, source).use { doc ->
+                      val form = doc.documentCatalog.acroForm ?: return emptyList()
+                      form.fieldTree.filterIsInstance<PDTerminalField>().map { f ->
+                          when (f) {
+                              is PDCheckBox -> FormField(f.fullyQualifiedName, FieldType.CHECKBOX, f.isChecked.toString())
+                              is PDRadioButton -> FormField(f.fullyQualifiedName, FieldType.RADIO, f.value ?: "", f.exportValues)
+                              is PDChoice -> FormField(f.fullyQualifiedName, FieldType.CHOICE, f.valueAsString ?: "", f.options)
+                              else -> FormField(
+                                  f.fullyQualifiedName,
+                                  if (f.fieldType == "Tx") FieldType.TEXT else FieldType.OTHER,
+                                  f.valueAsString ?: ""
+                              )
+                          }
+                      }
+                  }
+
+              /**
+               * Fills fields from [values], optionally flattens (bakes fields into page
+               * content so they're no longer editable), and writes to [dest].
+               * The source file is never modified.
+               */
+              fun fillAndSave(
+                  context: Context,
+                  source: Uri,
+                  dest: Uri,
+                  values: Map<String, String>,
+                  flatten: Boolean
+              ) {
+                  open(context, source).use { doc ->
+                      val form = doc.documentCatalog.acroForm ?: error("This PDF has no fillable form")
+
+                      values.forEach { (name, v) ->
+                          when (val field = form.getField(name)) {
+                              is PDCheckBox -> if (v == "true") field.check() else field.unCheck()
+                              null -> Unit
+                              else -> field.setValue(v)
+                          }
+                      }
+
+                      if (flatten) {
+                          form.setNeedAppearances(false)
+                          form.flatten() // removes widgets, draws values into page content
+                      }
+
+                      context.contentResolver.openOutputStream(dest, "wt")?.use { doc.save(it) }
+                          ?: error("Cannot write $dest")
+                  }
+              }
+
+              /** Flatten an already-filled PDF without changing any values. */
+              fun flattenOnly(context: Context, source: Uri, dest: Uri) =
+                  fillAndSave(context, source, dest, emptyMap(), flatten = true)
+          }
+          EOF
+          cat > app/src/main/java/com/example/pdffiller/MainActivity.kt <<'EOF'
+          package com.example.pdffiller
+
+          import android.net.Uri
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  PdfFormEngine.init(this)
+                  setContent { MaterialTheme { FillerScreen() } }
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun FillerScreen() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+
+              var source by remember { mutableStateOf<Uri?>(null) }
+              var fields by remember { mutableStateOf(emptyList<FormField>()) }
+              val values = remember { mutableStateMapOf<String, String>() }
+              var flatten by remember { mutableStateOf(true) }
+              var status by remember { mutableStateOf("Pick a PDF to begin") }
+
+              val openLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.OpenDocument()
+              ) { uri ->
+                  if (uri == null) return@rememberLauncherForActivityResult
+                  scope.launch {
+                      runCatching { withContext(Dispatchers.IO) { PdfFormEngine.listFields(ctx, uri) } }
+                          .onSuccess { list ->
+                              source = uri
+                              fields = list
+                              values.clear()
+                              list.forEach { values[it.name] = it.value }
+                              status = if (list.isEmpty()) "No fillable fields found" else "${list.size} fields"
+                          }
+                          .onFailure { status = "Open failed: ${it.message}" }
+                  }
+              }
+
+              val saveLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.CreateDocument("application/pdf")
+              ) { dest ->
+                  val src = source
+                  if (dest == null || src == null) return@rememberLauncherForActivityResult
+                  scope.launch {
+                      runCatching {
+                          withContext(Dispatchers.IO) {
+                              PdfFormEngine.fillAndSave(ctx, src, dest, values.toMap(), flatten)
+                          }
+                      }
+                          .onSuccess { status = if (flatten) "Saved (flattened)" else "Saved (still editable)" }
+                          .onFailure { status = "Save failed: ${it.message}" }
+                  }
+              }
+
+              Scaffold(topBar = { TopAppBar(title = { Text("PDF Filler") }) }) { pad ->
+                  Column(Modifier.padding(pad).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                      Button(onClick = { openLauncher.launch(arrayOf("application/pdf")) }) { Text("Open PDF") }
+                      Text(status, style = MaterialTheme.typography.bodySmall)
+
+                      LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                          items(fields, key = { it.name }) { f ->
+                              when (f.type) {
+                                  FieldType.CHECKBOX -> Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Checkbox(
+                                          checked = values[f.name] == "true",
+                                          onCheckedChange = { values[f.name] = it.toString() }
+                                      )
+                                      Text(f.name)
+                                  }
+                                  FieldType.CHOICE, FieldType.RADIO -> ChoiceField(f, values[f.name] ?: "") {
+                                      values[f.name] = it
+                                  }
+                                  else -> OutlinedTextField(
+                                      value = values[f.name] ?: "",
+                                      onValueChange = { values[f.name] = it },
+                                      label = { Text(f.name) },
+                                      enabled = f.type == FieldType.TEXT,
+                                      modifier = Modifier.fillMaxWidth()
+                                  )
+                              }
+                          }
+                      }
+
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Switch(checked = flatten, onCheckedChange = { flatten = it })
+                          Spacer(Modifier.width(8.dp))
+                          Text("Flatten on save")
+                      }
+                      Button(
+                          onClick = { saveLauncher.launch("filled.pdf") },
+                          enabled = source != null && fields.isNotEmpty(),
+                          modifier = Modifier.fillMaxWidth()
+                      ) { Text("Save") }
+                  }
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          private fun ChoiceField(f: FormField, current: String, onPick: (String) -> Unit) {
+              var open by remember { mutableStateOf(false) }
+              ExposedDropdownMenuBox(expanded = open, onExpandedChange = { open = it }) {
+                  OutlinedTextField(
+                      value = current,
+                      onValueChange = {},
+                      readOnly = true,
+                      label = { Text(f.name) },
+                      modifier = Modifier.menuAnchor().fillMaxWidth()
+                  )
+                  ExposedDropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                      f.options.forEach { opt ->
+                          DropdownMenuItem(text = { Text(opt) }, onClick = { onPick(opt); open = false })
+                      }
+                  }
+              }
+          }
+          EOF
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
